@@ -197,6 +197,16 @@ void push_dir(dir_state_t* state, const char* dirname);
 void pop_dir(dir_state_t* state);
 int create_directories(const char* path);
 
+// Print function declarations
+void print_unit_info(const char* prefix, unit_info_s *ui);
+void print_unit_logi(const char* prefix, unit_logi_s *ul);
+void print_boot_info(const char* prefix, boot_info_s *bi);
+void print_head(const char* prefix, head_s *hd);
+void print_dirent(const char* prefix, dirent_s *dir);
+void print_stat(const char* prefix, stat_s *st);
+void print_extptr(const char* prefix, const char* label, extptr_s *ptr);
+void print_status(const char* prefix, status_b *status);
+
 // Function to swap endianness if needed
 uint16_t swap16(uint16_t val) {
     return ntohs(val);
@@ -775,6 +785,11 @@ void read_blocks(FILE *fp, blocks_s *blocks) {
     read_unit_info(fp, &blocks->ui);
     read_unit_logi(fp, &blocks->ul);
     
+    if (g_options.verbose) {
+        print_unit_info("      ", &blocks->ui);
+        print_unit_logi("      ", &blocks->ul);
+    }
+    
     long pos = ftell(fp);
     fseek(fp, -40-32, SEEK_CUR);
     
@@ -791,12 +806,21 @@ void read_blocks(FILE *fp, blocks_s *blocks) {
         // Read header
         read_head(fp, &blocks->heads[blocks->head_count - 1]);
         
+        if (g_options.verbose) {
+            printf("      Header %zu:\n", blocks->head_count);
+            print_head("        ", &blocks->heads[blocks->head_count - 1]);
+        }
+        
         // Read corresponding dirent
         extent_type_e exttype = (blocks->heads[blocks->head_count - 1].status[0].flags2) & 0x03;
         if (exttype == EXTTYPE_DIR) {
             read_dirent(fp, &blocks->dirents[blocks->head_count - 1], block_top_pos,
                     blocks->heads[blocks->head_count - 1].text_offset_hi,
                     blocks->heads[blocks->head_count - 1].text_offset_lo);
+            
+            if (g_options.verbose) {
+                print_dirent("        ", &blocks->dirents[blocks->head_count - 1]);
+            }
         } else {
             // Initialize name to NULL for non-directory entries
             blocks->dirents[blocks->head_count - 1].name = NULL;
@@ -821,9 +845,17 @@ size_t read_partition(FILE *fp, part_s *part) {
     read_boot_info(fp, &part->bi);
     fseek(fp, -24, SEEK_CUR);
     
+    if (g_options.verbose) {
+        printf("  Partition Boot Info:\n");
+        print_boot_info("    ", &part->bi);
+    }
+    
     // Allocate and read blocks
     part->blocks = malloc(part->bi.unit_total * sizeof(blocks_s));
     for(int i = 0; i < part->bi.unit_total; i++) {
+        if (g_options.verbose) {
+            printf("    Logical Unit %d:\n", i + 1);
+        }
         read_blocks(fp, &part->blocks[i]);
     }
     return part->bi.unit_total * (1 << part->blocks[0].ui.unit_pow2);
@@ -1237,11 +1269,17 @@ int main(int argc, char *argv[]) {
     int partition_count = 0;
     
     // Read first partition
+    if (g_options.verbose) {
+        printf("Reading partition 0...\n");
+    }
     next_part = read_partition(fp, &partitions[0]);
     if (next_part > 0) {
         partition_count++;
         
         // Try to read second partition
+        if (g_options.verbose) {
+            printf("Reading partition 1...\n");
+        }
         fseek(fp, next_part, SEEK_SET);
         size_t next_part2 = read_partition(fp, &partitions[1]);
         if (next_part2 > 0) {
