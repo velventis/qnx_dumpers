@@ -156,6 +156,7 @@ typedef struct {
 typedef struct {
     boot_info_s bi;
     blocks_s *blocks;  // Array size determined by bi.unit_total
+    long efs_offset;   // Offset where this EFS partition starts in the file
 } part_s;
 
 // Compression structures for file extraction
@@ -180,6 +181,14 @@ typedef struct {
     size_t len;
 } dir_state_t;
 
+// File extent information for multi-extent files
+typedef struct {
+    long offset;      // Absolute file offset to data
+    uint16_t size;    // Size of data at this extent
+    uint16_t logi_unit; // Logical unit containing this extent
+    uint16_t index;   // Index within the unit
+} file_extent_t;
+
 #pragma pack(pop)
 
 // Forward declarations
@@ -188,14 +197,20 @@ void extract_partition(FILE *fp, part_s *part);
 void extract_directory_entry(FILE *fp, part_s *part, dir_state_t *dir_state, dirent_s *dirent);
 head_s* find_file_extent(part_s *part, uint16_t logi_unit, uint16_t index);
 void traverse_directory(FILE *fp, part_s *part, uint16_t logi_unit, uint16_t index);
-int extract_file_data(FILE *fp, long base_offset, uint8_t text_offset_hi, uint16_t text_offset_lo, 
-                     uint16_t text_size, const char *output_path);
+int collect_file_extents(part_s *part, uint16_t logi_unit, uint16_t index, file_extent_t **extents, int *extent_count);
+int extract_contiguous_file_data(FILE *fp, file_extent_t *extents, int extent_count, uint8_t **data_buffer, size_t *total_size);
+int extract_file_data(FILE *fp, part_s *part, uint16_t logi_unit, uint16_t index, const char *output_path);
 int extract_compressed_file_data(FILE *fp, long file_offset, const char *output_path);
 int extract_raw_file_data(FILE *fp, long file_offset, uint16_t file_size, const char *output_path);
 void init_dir_state(dir_state_t* state);
 void push_dir(dir_state_t* state, const char* dirname);
 void pop_dir(dir_state_t* state);
 int create_directories(const char* path);
+
+// CKSUM header handling functions
+int is_cksum_file(FILE *fp);
+long find_first_efs_partition(FILE *fp);
+long find_next_efs_partition(FILE *fp, long start_offset);
 
 // Print function declarations
 void print_unit_info(const char* prefix, unit_info_s *ui);
@@ -276,6 +291,156 @@ int create_directories(const char* path) {
     return 0;
 }
 
+// CKSUM header handling functions
+int is_cksum_file(FILE *fp) {
+    char header[16];
+    long current_pos = ftell(fp);
+    
+    // Read the first 16 bytes to check for CKSUM signature
+    fseek(fp, 0, SEEK_SET);
+    if (fread(header, 1, 16, fp) != 16) {
+        fseek(fp, current_pos, SEEK_SET);
+        return 0;
+    }
+    
+    // Restore file position
+    fseek(fp, current_pos, SEEK_SET);
+    
+    // Check for "CHKSUM:" signature (with or without space)
+    return (memcmp(header, "CHKSUM:", 7) == 0);
+}
+
+long find_first_efs_partition(FILE *fp) {
+    char buffer[4096];
+    long current_pos = ftell(fp);
+    
+    if (g_options.verbose) {
+        printf("Scanning for EFS partitions in CKSUM file...\n");
+    }
+    
+    // Get file size to know when to stop scanning
+    fseek(fp, 0, SEEK_END);
+    long file_size_tmp = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    if (file_size_tmp < 0) {
+        return -1;
+    }
+    size_t file_size = (size_t)file_size_tmp;
+    
+    // Search for QSSL_F3S signature throughout the file
+    size_t offset = 0;
+    while (offset < file_size - 8) {
+        size_t bytes_to_read = (offset + sizeof(buffer) > file_size) ? 
+                              (file_size - offset) : sizeof(buffer);
+        
+        if (fseek(fp, offset, SEEK_SET) != 0) {
+            break;
+        }
+        
+        size_t bytes_read = fread(buffer, 1, bytes_to_read, fp);
+        if (bytes_read < 8) {
+            break;
+        }
+        
+        // Search for QSSL_F3S in this buffer
+        for (size_t i = 0; i <= bytes_read - 8; i++) {
+            if (memcmp(buffer + i, "QSSL_F3S", 8) == 0) {
+                size_t signature_offset = offset + i;
+                // EFS partition starts 0x2C bytes before the QSSL_F3S signature
+                long partition_start = (signature_offset >= 0x2C) ? (long)(signature_offset - 0x2C) : -1;
+                
+                if (partition_start < 0) {
+                    continue;
+                }
+                
+                if (g_options.verbose) {
+                    printf("Found EFS partition at offset 0x%lx (signature at 0x%zx)\n", 
+                           partition_start, signature_offset);
+                }
+                
+                fseek(fp, current_pos, SEEK_SET);
+                return partition_start;
+            }
+        }
+        
+        // Move forward, but overlap by 7 bytes to ensure we don't miss signatures across buffer boundaries
+        offset += bytes_read - 7;
+    }
+    
+    if (g_options.verbose) {
+        printf("No EFS partition found in file\n");
+    }
+    
+    fseek(fp, current_pos, SEEK_SET);
+    return -1;  // No EFS partition found
+}
+
+long find_next_efs_partition(FILE *fp, long start_offset) {
+    char buffer[4096];
+    long current_pos = ftell(fp);
+    
+    if (g_options.verbose) {
+        printf("Scanning for next EFS partition starting from offset 0x%lx...\n", start_offset);
+    }
+    
+    // Get file size to know when to stop scanning
+    fseek(fp, 0, SEEK_END);
+    long file_size_tmp = ftell(fp);
+    
+    if (file_size_tmp < 0) {
+        return -1;
+    }
+    size_t file_size = (size_t)file_size_tmp;
+    
+    // Search for QSSL_F3S signature starting from the given offset
+    size_t offset = (size_t)start_offset;
+    while (offset < file_size - 8) {
+        size_t bytes_to_read = (offset + sizeof(buffer) > file_size) ? 
+                              (file_size - offset) : sizeof(buffer);
+        
+        if (fseek(fp, offset, SEEK_SET) != 0) {
+            break;
+        }
+        
+        size_t bytes_read = fread(buffer, 1, bytes_to_read, fp);
+        if (bytes_read < 8) {
+            break;
+        }
+        
+        // Search for QSSL_F3S in this buffer
+        for (size_t i = 0; i <= bytes_read - 8; i++) {
+            if (memcmp(buffer + i, "QSSL_F3S", 8) == 0) {
+                size_t signature_offset = offset + i;
+                // EFS partition starts 0x2C bytes before the QSSL_F3S signature
+                long partition_start = (signature_offset >= 0x2C) ? (long)(signature_offset - 0x2C) : -1;
+                
+                if (partition_start < 0) {
+                    continue;
+                }
+                
+                if (g_options.verbose) {
+                    printf("Found next EFS partition at offset 0x%lx (signature at 0x%zx)\n", 
+                           partition_start, signature_offset);
+                }
+                
+                fseek(fp, current_pos, SEEK_SET);
+                return partition_start;
+            }
+        }
+        
+        // Move forward, but overlap by 7 bytes to ensure we don't miss signatures across buffer boundaries
+        offset += bytes_read - 7;
+    }
+    
+    if (g_options.verbose) {
+        printf("No additional EFS partitions found\n");
+    }
+    
+    fseek(fp, current_pos, SEEK_SET);
+    return -1;  // No additional EFS partition found
+}
+
 // Find a file extent by logical unit and index
 head_s* find_file_extent(part_s *part, uint16_t logi_unit, uint16_t index) {
     // Check if logical unit is valid
@@ -300,6 +465,143 @@ head_s* find_file_extent(part_s *part, uint16_t logi_unit, uint16_t index) {
     }
     
     return NULL;
+}
+
+// Collect all extents for a file by following the extent chain
+int collect_file_extents(part_s *part, uint16_t logi_unit, uint16_t index, file_extent_t **extents, int *extent_count) {
+    *extents = NULL;
+    *extent_count = 0;
+    
+    uint16_t current_logi = logi_unit;
+    uint16_t current_index = index;
+    
+    // Follow the extent chain
+    while (current_logi != 0 && current_logi != 65535) {
+        if (current_logi > part->bi.unit_total) {
+            break;
+        }
+        
+        blocks_s *blocks = &part->blocks[current_logi - 1];
+        if (current_index >= blocks->head_count) {
+            break;
+        }
+        
+        head_s *head = &blocks->heads[current_index];
+        extent_type_e exttype = (head->status[0].flags2) & 0x03;
+        
+        if (exttype != EXTTYPE_FILE) {
+            break;  // Not a file extent
+        }
+        
+        // Calculate the actual data offset within the block
+        // Each block is unit_pow2 size, data comes before the head_s tables
+        long block_base = part->efs_offset + (current_logi - 1) * (1LL << blocks->ui.unit_pow2);
+        long data_offset = block_base + (long)(head->text_offset_hi) * 0x40000 + (long)(head->text_offset_lo) * 4;
+        
+        // Reallocate extent array
+        *extents = realloc(*extents, (*extent_count + 1) * sizeof(file_extent_t));
+        if (!*extents) {
+            *extent_count = 0;
+            return -1;
+        }
+        
+        // Store extent information
+        (*extents)[*extent_count].offset = data_offset;
+        (*extents)[*extent_count].size = head->text_size;
+        (*extents)[*extent_count].logi_unit = current_logi;
+        (*extents)[*extent_count].index = current_index;
+        (*extent_count)++;
+        
+        if (g_options.verbose) {
+            printf("      Extent %d: unit=%u, index=%u, offset=0x%lx, size=%u\n", 
+                   *extent_count, current_logi, current_index, data_offset, head->text_size);
+        }
+        
+        // Move to next extent
+        if (head->next.logi_unit == 0 || head->next.logi_unit == 65535) {
+            break;
+        }
+        current_logi = head->next.logi_unit;
+        current_index = head->next.index;
+        
+        // Safety check to prevent infinite loops
+        if (*extent_count > 100) {
+            if (g_options.verbose) {
+                printf("      Warning: Hit safety limit of 100 extents\n");
+            }
+            break;
+        }
+    }
+    
+    return *extent_count;
+}
+
+// Extract contiguous file data from multiple extents
+int extract_contiguous_file_data(FILE *fp, file_extent_t *extents, int extent_count, uint8_t **data_buffer, size_t *total_size) {
+    *data_buffer = NULL;
+    *total_size = 0;
+    
+    if (extent_count == 0) {
+        return 0;  // Empty file
+    }
+    
+    // Calculate total size needed
+    size_t total_data_size = 0;
+    for (int i = 0; i < extent_count; i++) {
+        total_data_size += extents[i].size;
+    }
+    
+    if (total_data_size == 0) {
+        return 0;  // Empty file
+    }
+    
+    // Allocate buffer for all data
+    *data_buffer = malloc(total_data_size);
+    if (!*data_buffer) {
+        return -1;
+    }
+    
+    // Read data from each extent
+    size_t buffer_pos = 0;
+    long current_pos = ftell(fp);
+    
+    for (int i = 0; i < extent_count; i++) {
+        if (g_options.verbose) {
+            printf("        Reading extent %d: offset=0x%lx, size=%u\n", 
+                   i + 1, extents[i].offset, extents[i].size);
+        }
+        
+        // Seek to extent data
+        if (fseek(fp, extents[i].offset, SEEK_SET) != 0) {
+            fprintf(stderr, "Failed to seek to extent %d at offset 0x%lx\n", i, extents[i].offset);
+            free(*data_buffer);
+            *data_buffer = NULL;
+            fseek(fp, current_pos, SEEK_SET);
+            return -1;
+        }
+        
+        // Read extent data
+        size_t bytes_read = fread(*data_buffer + buffer_pos, 1, extents[i].size, fp);
+        if (bytes_read != extents[i].size) {
+            fprintf(stderr, "Failed to read extent %d: expected %u bytes, got %zu bytes\n", 
+                   i, extents[i].size, bytes_read);
+            free(*data_buffer);
+            *data_buffer = NULL;
+            fseek(fp, current_pos, SEEK_SET);
+            return -1;
+        }
+        
+        buffer_pos += extents[i].size;
+    }
+    
+    *total_size = total_data_size;
+    fseek(fp, current_pos, SEEK_SET);
+    
+    if (g_options.verbose) {
+        printf("        Successfully collected %zu bytes from %d extents\n", *total_size, extent_count);
+    }
+    
+    return 0;
 }
 
 // Traverse directory structure by following the extent chain
@@ -388,28 +690,12 @@ void read_directory_contents(FILE *fp, part_s *part, dirent_s *dir_entry, const 
                                filepath, content_entry->first.logi_unit, content_entry->first.index);
                     }
                     
-                    head_s *file_head = find_file_extent(part, content_entry->first.logi_unit, content_entry->first.index);
-                    if (file_head && file_head->text_size > 0) {
-                        long file_base_offset = (content_entry->first.logi_unit - 1) * (1 << part->blocks[0].ui.unit_pow2);
-                        
-                        if (extract_file_data(fp, file_base_offset, file_head->text_offset_hi, 
-                                             file_head->text_offset_lo, file_head->text_size, filepath) == 0) {
-                            if (g_options.verbose) {
-                                printf("          Successfully extracted: %s\n", filepath);
-                            }
-                        } else {
-                            printf("          Failed to extract: %s\n", filepath);
+                    if (extract_file_data(fp, part, content_entry->first.logi_unit, content_entry->first.index, filepath) == 0) {
+                        if (g_options.verbose) {
+                            printf("          Successfully extracted: %s\n", filepath);
                         }
                     } else {
-                        // Create empty file
-                        create_directories(filepath);
-                        int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                        if (fd >= 0) {
-                            close(fd);
-                            if (g_options.verbose) {
-                                printf("          Created empty file: %s\n", filepath);
-                            }
-                        }
+                        printf("          Failed to extract: %s\n", filepath);
                     }
                 }
             }
@@ -464,44 +750,134 @@ void traverse_directory(FILE *fp, part_s *part, uint16_t logi_unit, uint16_t ind
     }
 }
 
-// File extraction function - reads compressed file data from the filesystem
-int extract_file_data(FILE *fp, long base_offset, uint8_t text_offset_hi, uint16_t text_offset_lo, 
-                     uint16_t text_size, const char *output_path) {
-    // Calculate the absolute offset to the file data using the same logic as read_dirent
-    long file_offset = base_offset + (long)(text_offset_hi) * 0x40000 + (long)(text_offset_lo) * 4;
-    
-    long current_pos = ftell(fp);
-    if (fseek(fp, file_offset, SEEK_SET) != 0) {
-        fprintf(stderr, "Failed to seek to file data at offset 0x%lx\n", file_offset);
-        return -1;
-    }
-    
-    // First, check if this looks like compressed data by examining the first few bytes
-    uint8_t header_bytes[16];
-    if (fread(header_bytes, 1, 16, fp) != 16) {
-        fprintf(stderr, "Failed to read header bytes for %s\n", output_path);
-        fseek(fp, current_pos, SEEK_SET);
-        return -1;
-    }
-    
-    // Reset to start of data
-    fseek(fp, file_offset, SEEK_SET);
-    
-    // Check if this looks like compressed data by examining the header structure
-    // First check for the compression signature
-    if (memcmp(header_bytes, "iwlyfmbp", 8) == 0) {
-        // This has the compression signature - try compressed extraction
-        if (g_options.verbose) {
-            printf("Found compression signature in %s\n", output_path);
-        }
-        return extract_compressed_file_data(fp, file_offset, output_path);
-    }
-    
-    // Default to raw file extraction for files that don't have compression signature
+// File extraction function - properly follows extent chains and respects block structure
+int extract_file_data(FILE *fp, part_s *part, uint16_t logi_unit, uint16_t index, const char *output_path) {
     if (g_options.verbose) {
-        printf("Extracting raw file: %s (size: %u bytes)\n", output_path, text_size);
+        printf("      Extracting file: %s from unit=%u, index=%u\n", output_path, logi_unit, index);
     }
-    return extract_raw_file_data(fp, file_offset, text_size, output_path);
+    
+    // Collect all extents for this file
+    file_extent_t *extents = NULL;
+    int extent_count = 0;
+    
+    if (collect_file_extents(part, logi_unit, index, &extents, &extent_count) < 0) {
+        fprintf(stderr, "Failed to collect extents for %s\n", output_path);
+        return -1;
+    }
+    
+    if (extent_count == 0) {
+        // Empty file
+        create_directories(output_path);
+        int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            close(fd);
+            if (g_options.verbose) {
+                printf("        Created empty file: %s\n", output_path);
+            }
+            return 0;
+        } else {
+            fprintf(stderr, "Failed to create empty file %s: %s\n", output_path, strerror(errno));
+            return -1;
+        }
+    }
+    
+    // Extract contiguous file data from all extents
+    uint8_t *file_data = NULL;
+    size_t total_size = 0;
+    
+    if (extract_contiguous_file_data(fp, extents, extent_count, &file_data, &total_size) < 0) {
+        fprintf(stderr, "Failed to extract file data for %s\n", output_path);
+        free(extents);
+        return -1;
+    }
+    
+    free(extents);  // Done with extent array
+    
+    if (total_size == 0) {
+        // Empty file
+        create_directories(output_path);
+        int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            close(fd);
+            if (g_options.verbose) {
+                printf("        Created empty file: %s\n", output_path);
+            }
+        }
+        return 0;
+    }
+    
+    // Check if this is compressed data
+    if (total_size >= 8 && memcmp(file_data, "iwlyfmbp", 8) == 0) {
+        // This is compressed data - write to temp file and decompress
+        if (g_options.verbose) {
+            printf("        Found compression signature in %s\n", output_path);
+        }
+        
+        // Create temporary file for compressed data
+        char temp_path[MAX_PATH_LEN];
+        snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
+        
+        create_directories(temp_path);
+        int temp_fd = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (temp_fd < 0) {
+            fprintf(stderr, "Failed to create temp file %s: %s\n", temp_path, strerror(errno));
+            free(file_data);
+            return -1;
+        }
+        
+        // Write compressed data to temp file
+        if (write(temp_fd, file_data, total_size) != (ssize_t)total_size) {
+            fprintf(stderr, "Failed to write compressed data to %s: %s\n", temp_path, strerror(errno));
+            close(temp_fd);
+            unlink(temp_path);
+            free(file_data);
+            return -1;
+        }
+        close(temp_fd);
+        free(file_data);
+        
+        // Open temp file and decompress
+        FILE *temp_fp = fopen(temp_path, "rb");
+        if (!temp_fp) {
+            fprintf(stderr, "Failed to reopen temp file %s: %s\n", temp_path, strerror(errno));
+            unlink(temp_path);
+            return -1;
+        }
+        
+        int result = extract_compressed_file_data(temp_fp, 0, output_path);
+        fclose(temp_fp);
+        unlink(temp_path);  // Clean up temp file
+        
+        return result;
+    } else {
+        // Raw file data - write directly
+        if (g_options.verbose) {
+            printf("        Extracting raw file: %s (size: %zu bytes)\n", output_path, total_size);
+        }
+        
+        create_directories(output_path);
+        int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            fprintf(stderr, "Failed to create file %s: %s\n", output_path, strerror(errno));
+            free(file_data);
+            return -1;
+        }
+        
+        if (write(fd, file_data, total_size) != (ssize_t)total_size) {
+            fprintf(stderr, "Failed to write data to %s: %s\n", output_path, strerror(errno));
+            close(fd);
+            free(file_data);
+            return -1;
+        }
+        
+        close(fd);
+        free(file_data);
+        
+        if (g_options.verbose) {
+            printf("        Successfully extracted %zu bytes to %s\n", total_size, output_path);
+        }
+        return 0;
+    }
 }
 
 // Extract raw (uncompressed) file data
@@ -832,7 +1208,13 @@ void read_blocks(FILE *fp, blocks_s *blocks) {
             break;
         }
 
-        //if (blocks->head_count > 6) break;
+        // Safety limit to prevent infinite loops
+        if (blocks->head_count > 1000) {
+            if (g_options.verbose) {
+                printf("      Warning: Hit safety limit of 1000 headers, breaking\n");
+            }
+            break;
+        }
     }
     fseek(fp, pos, SEEK_SET);
 }
@@ -1077,7 +1459,13 @@ void extract_partition(FILE *fp, part_s *part) {
     }
     
     // Traverse the filesystem tree starting from root
+    if (g_options.verbose) {
+        printf("  Starting extraction traversal...\n");
+    }
     traverse_directory(fp, part, part->bi.root.logi_unit, part->bi.root.index);
+    if (g_options.verbose) {
+        printf("  Extraction traversal completed\n");
+    }
 }
 
 // Process a directory entry and extract files by following extent pointers
@@ -1136,26 +1524,11 @@ void extract_directory_entry(FILE *fp, part_s *part, dir_state_t *dir_state, dir
         printf("      File entry: %s (extent: unit=%u, index=%u)\n", 
                filepath, dirent->first.logi_unit, dirent->first.index);
         
-        // Find the file extent using the first pointer
-        head_s *file_head = find_file_extent(part, dirent->first.logi_unit, dirent->first.index);
-        if (file_head && file_head->text_size > 0) {
-            // Calculate base offset for the logical unit containing the file data
-            long file_base_offset = (dirent->first.logi_unit - 1) * (1 << part->blocks[0].ui.unit_pow2);
-            
-            if (extract_file_data(fp, file_base_offset, file_head->text_offset_hi, 
-                                 file_head->text_offset_lo, file_head->text_size, filepath) == 0) {
-                printf("        Successfully extracted: %s\n", filepath);
-            } else {
-                fprintf(stderr, "        Failed to extract: %s\n", filepath);
-            }
+        // Extract the file using the new implementation
+        if (extract_file_data(fp, part, dirent->first.logi_unit, dirent->first.index, filepath) == 0) {
+            printf("        Successfully extracted: %s\n", filepath);
         } else {
-            // Create empty file if no data found
-            create_directories(filepath);
-            int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) {
-                close(fd);
-                printf("        Created empty file: %s\n", filepath);
-            }
+            fprintf(stderr, "        Failed to extract: %s\n", filepath);
         }
     }
 }
@@ -1263,6 +1636,32 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    // Check if this is a CKSUM file and adjust file pointer if needed
+    long efs_offset = 0;
+    if (is_cksum_file(fp)) {
+        if (g_options.verbose) {
+            printf("Detected CKSUM file format\n");
+        }
+        
+        efs_offset = find_first_efs_partition(fp);
+        if (efs_offset < 0) {
+            fprintf(stderr, "Error: No EFS partitions found in CKSUM file\n");
+            fclose(fp);
+            return 1;
+        }
+        
+        // Seek to the first EFS partition
+        fseek(fp, efs_offset, SEEK_SET);
+        
+        if (g_options.verbose) {
+            printf("Positioned at EFS partition offset 0x%lx\n", efs_offset);
+        }
+    } else {
+        if (g_options.verbose) {
+            printf("Standard EFS file format detected\n");
+        }
+    }
+    
     // Read partitions
     size_t next_part = 0;
     part_s partitions[2];
@@ -1273,17 +1672,25 @@ int main(int argc, char *argv[]) {
         printf("Reading partition 0...\n");
     }
     next_part = read_partition(fp, &partitions[0]);
+    partitions[0].efs_offset = efs_offset;  // Store the EFS offset
     if (next_part > 0) {
         partition_count++;
         
-        // Try to read second partition
+        // Try to find second partition by searching for next QSSL_F3S signature
         if (g_options.verbose) {
             printf("Reading partition 1...\n");
         }
-        fseek(fp, next_part, SEEK_SET);
-        size_t next_part2 = read_partition(fp, &partitions[1]);
-        if (next_part2 > 0) {
-            partition_count++;
+        
+        // Search for the next EFS partition starting after the first one
+        long search_start = efs_offset + next_part;
+        long second_efs_offset = find_next_efs_partition(fp, search_start);
+        if (second_efs_offset >= 0) {
+            fseek(fp, second_efs_offset, SEEK_SET);
+            size_t next_part2 = read_partition(fp, &partitions[1]);
+            partitions[1].efs_offset = second_efs_offset;  // Store the second EFS offset
+            if (next_part2 > 0) {
+                partition_count++;
+            }
         }
     }
     

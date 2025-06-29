@@ -1,0 +1,121 @@
+%%{ init: { "flowchart": { "curve": "basis" } } }%%
+classDiagram
+    %% QNX EFS – core on-disk data structures and their relationships
+
+    %% === Generic helpers ===
+    class extptr_s {
+        uint16 logi_unit
+        uint16 index
+    }
+
+    class status_b {
+        uint8 valid
+        uint8 moved
+        uint8 erased
+        uint8 bad
+    }
+
+    class stat_s {
+        uint16 struct_size
+        uint16 mode
+        uint32 uid
+        uint32 gid
+        uint32 mtime
+        uint32 ctime
+    }
+
+    %% === Partition / super-block level ===
+    class boot_info_s {
+        uint16 struct_size
+        uint8  rev_major
+        uint8  rev_minor
+        char   sig[8]
+        uint16 unit_index
+        uint16 unit_total
+        uint16 unit_spare
+        uint16 align_pow2
+        extptr_s root  %% -> first directory entry of the FS
+    }
+
+    class cmp_head_s {
+        char    sig[8]
+        uint32  size
+        uint16  blk_size
+        uint8   cmptype  %% 0=LZO, 1=UCL
+        uint8   flags
+    }
+
+    %% === Unit (erase-block) metadata ===
+    class unit_info_s {
+        uint16 struct_size
+        char   endian
+        uint8  pad
+        uint16 unit_pow2
+        uint16 reserve
+        uint32 erase_count
+        extptr_s boot  %% -> cmp_head_s for this unit
+    }
+
+    class unit_logi_s {
+        uint16 struct_size
+        uint16 logi        %% logical-to-physical mapping
+        uint32 age
+        uint32 md5[4]
+    }
+
+    %% === Physical block header ===
+    class head_s {
+        status_b status[3]
+        uint16   pad[3]
+        uint8    reserve
+        uint8    text_offset_hi
+        uint16   text_offset_lo
+        uint16   text_size
+        extptr_s next   %% -> next head_s (file extent chain)
+        extptr_s super  %% -> dirent_s that owns this extent
+    }
+
+    %% === Directory structures ===
+    class dirent_s {
+        uint16 struct_size
+        uint8  moves
+        uint8  namelen
+        extptr_s first  %% -> first head_s / extent of file or sub-dir
+        char   name[]   %% variable length
+        stat_s stat
+    }
+
+    %% === Virtual containers used by the extraction tool ===
+    class blocks_s {
+        unit_info_s ui
+        unit_logi_s ul
+        head_s      heads[]
+        dirent_s    dirents[]
+    }
+
+    class part_s {
+        boot_info_s bi
+        blocks_s    blocks[]
+        long        efs_offset
+    }
+
+    %% ==================== Relations ====================
+    boot_info_s  --> extptr_s : root
+    boot_info_s  ..> cmp_head_s : "located in first unit"
+
+    unit_info_s  --> extptr_s : boot
+    blocks_s     --> unit_info_s
+    blocks_s     --> unit_logi_s
+
+    blocks_s     --> head_s     : "array (per physical block)"
+    blocks_s     --> dirent_s   : "array (parallel to heads)"
+
+    head_s       --> status_b
+    head_s       --> extptr_s : next
+    head_s       --> extptr_s : super
+
+    dirent_s     --> stat_s
+    dirent_s     --> extptr_s : first
+
+    part_s       --> boot_info_s
+    part_s       --> blocks_s
