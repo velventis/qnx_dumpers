@@ -1,1 +1,23 @@
 efsdump
+ifsdump
+decompress-qnx-elf
+efsdump.old
+
+# Local extraction output
+tmp/
+tmp*/
+test_elf/*.elf
+*.tmp
+
+# Local/debug build artifacts
+*.o
+*.a
+*.so
+*.dSYM/
+core
+core.*
+
+# Local editor/OS files
+*~
+*.swp
+.DS_Store

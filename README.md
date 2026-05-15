@@ -1,11 +1,12 @@
 # QNX Filesystem Extraction Tools
 
-A comprehensive collection of tools to extract files from QNX filesystem images. This suite includes extractors for both QNX Compressed-EFS and QNX IFS (Image File System) formats, supporting various compression methods (LZO, UCL, zlib) commonly found in QNX embedded systems.
+A collection of tools to extract files from QNX filesystem images and standalone QNX compressed-ELF files. The suite supports QNX Compressed-EFS, QNX IFS (Image File System), and individual compressed ELF payloads using LZO, UCL, and zlib where applicable.
 
 ## Tools Included
 
 - **efsdump** - QNX Compressed-EFS filesystem extractor
 - **ifsdump** - QNX IFS (Image File System) extractor
+- **decompress-qnx-elf** - Standalone QNX compressed-ELF decompressor for files beginning with `"iwlyfmbp"`
 
 ---
 
@@ -57,7 +58,7 @@ Each logical unit contains multiple extents with headers:
 - `text_offset_hi`, `text_offset_lo`: 48-bit offset to file data
 - `text_size`: Size of the file/directory data
 - `next`: Pointer to next extent in chain
-- `status[2]`: Status flags including extent type
+- `status[3]`: Status flags including extent type
 
 #### Directory Entry Structure (`dirent_s`)
 Directory entries contain metadata about files and subdirectories:
@@ -69,10 +70,10 @@ Directory entries contain metadata about files and subdirectories:
 
 #### Extent Types
 The filesystem uses different extent types:
-- `EXTTYPE_DIR` (0): Directory entries
-- `EXTTYPE_FILE` (1): File data extents
-- `EXTTYPE_SYS` (2): System/metadata extents
-- `EXTTYPE_XIP` (3): Execute-in-place extents
+- `EXTTYPE_XIP` (0): Execute-in-place extents
+- `EXTTYPE_SYS` (1): System/metadata extents
+- `EXTTYPE_DIR` (2): Directory entries
+- `EXTTYPE_FILE` (3): File data extents
 
 ### File Compression
 
@@ -91,6 +92,9 @@ Files are identified as compressed by examining the first 8 bytes for the magic 
 Compressed files are divided into blocks:
 - `next`: Offset to next block (0 = last block)
 - `usize`: Uncompressed size of this block
+- `prev`, `pusize`: Previous block metadata
+
+Compressed headers and block headers are parsed as little-endian values. File data is streamed through extent chains directly; current `efsdump` no longer creates temporary compressed payload files.
 
 ### Directory Hierarchy and Traversal Strategy
 
@@ -134,7 +138,7 @@ The filesystem uses a directory-centric traversal model where:
 #### Extraction Functions
 - `extract_file_data()`: Main file extraction dispatcher
 - `extract_compressed_file_data()`: Handles LZO/UCL compressed files
-- `extract_raw_file_data()`: Handles uncompressed files
+- `extent_reader_read()`: Streams raw or compressed payload bytes across chained file extents
 
 #### Decompression Functions
 - LZO decompression: `lzo1x_decompress_safe()`
@@ -159,6 +163,7 @@ The filesystem uses a directory-centric traversal model where:
 
 4. **File Extraction**
    - Detect compression by examining file headers
+   - Stream file data across extent chains
    - Decompress using appropriate algorithm (LZO/UCL)
    - Write extracted files to target directory
 
@@ -265,6 +270,54 @@ Shows detailed information about:
 - File extraction details
 - Compression information
 - Block-by-block decompression progress
+
+### Robustness Notes
+
+Current `efsdump` includes several safeguards for malformed or partially erased dumps:
+- Bounded parsing and checked binary reads for core metadata structures
+- Directory traversal cycle detection
+- File extent cycle detection
+- Streaming extraction to avoid buffering entire files in memory
+- Non-fatal handling for unreadable trailing/erased logical units
+- Per-file errors do not abort the whole filesystem extraction
+
+---
+
+# QNX Compressed-ELF (decompress-qnx-elf)
+
+## Overview
+
+Some files inside QNX Compressed-EFS images are standalone compressed ELF payloads. These files start with the magic signature `"iwlyfmbp"` and contain a little-endian compression header followed by LZO or UCL compressed blocks. `decompress-qnx-elf` decompresses one such file directly without requiring a filesystem image.
+
+## Usage
+
+```bash
+# Positional output path
+./decompress-qnx-elf test_elf/app app.elf
+
+# Output path via option
+./decompress-qnx-elf -o ntpd.elf test_elf/ntpd
+
+# Verbose block-level decompression details
+./decompress-qnx-elf -v test_elf/sdi sdi.elf
+```
+
+### decompress-qnx-elf Command Line Options
+
+| Option | Long Option | Description |
+|--------|-------------|-------------|
+| `-o FILE` | `--output FILE` | Write decompressed ELF to FILE |
+| `-v` | `--verbose` | Print block-level details |
+| `-h` | `--help` | Show help message |
+
+### Output
+
+The output is the decompressed ELF file. For example, the sample inputs in `test_elf/` decompress to QNX 32-bit ELF executables:
+
+```bash
+./decompress-qnx-elf test_elf/app test_elf/app.elf
+file test_elf/app.elf
+```
 
 ---
 
@@ -598,8 +651,8 @@ Checksums: image=0x12345678 startup=0x87654321
 ## Prerequisites
 - GCC compiler
 - zlib1g-dev (zlib compression library) - **Required for ifsdump**
-- liblzo2-dev (LZO compression library) - **Required for both tools**
-- libucl-dev (UCL compression library) - **Required for both tools**
+- liblzo2-dev (LZO compression library) - **Required for efsdump, ifsdump, and decompress-qnx-elf**
+- libucl-dev (UCL compression library) - **Required for efsdump, ifsdump, and decompress-qnx-elf**
 
 ## Ubuntu/Debian Installation
 ```bash
@@ -608,12 +661,13 @@ sudo apt-get install build-essential zlib1g-dev liblzo2-dev libucl-dev
 
 ## Build
 ```bash
-# Build both tools
+# Build all tools
 make all
 
 # Build individual tools
 make efsdump
 make ifsdump
+make decompress-qnx-elf
 
 # Build with debugging symbols
 make debug
@@ -623,6 +677,9 @@ make check-deps
 
 # Run test suite
 make test
+
+# Run syntax/warning checks
+make lint
 ```
 
 ## Installation
@@ -663,7 +720,17 @@ make install DESTDIR=/usr/local
 ### "Compression detected but decompression failed"
 - Check that all required compression libraries are installed
 - Verify the compression type is supported (zlib, LZO, UCL)
-- Try using `-z` flag to disable zero field validation
+- For `ifsdump`, try using `-z` to disable zero field validation
+
+### "Invalid QNX compressed-ELF header" (decompress-qnx-elf)
+- Verify the input starts with the magic string `"iwlyfmbp"`
+- Confirm the input is the compressed file itself, not an already decompressed ELF
+- Use `xxd -l 16 <file>` or `hexdump -C <file> | head` to inspect the header
+
+### "Incomplete output" (decompress-qnx-elf or efsdump)
+- The compressed stream ended before the declared uncompressed size
+- The source file or filesystem image may be truncated
+- Re-run with `-v` to identify the failing compressed block
 
 ### Files extracted to wrong directories
 - This was a known issue that has been fixed in the current version
@@ -694,6 +761,7 @@ Use verbose mode (`-v`) to get detailed information about:
 
 - `efsdump.c` - QNX Compressed-EFS extractor source code
 - `ifsdump.c` - QNX IFS extractor source code
+- `decompress-qnx-elf.c` - Standalone QNX compressed-ELF decompressor
 - `README.md` - This documentation
 - `Makefile` - Build configuration
 
@@ -701,11 +769,20 @@ Use verbose mode (`-v`) to get detailed information about:
 
 # Changelog
 
+### Current Development
+- Added `decompress-qnx-elf` for standalone `"iwlyfmbp"` compressed ELF payloads
+- Added `make lint` and expanded `.gitignore` for local build/extraction artifacts
+- Updated `efsdump` to stream extraction through extent chains instead of buffering whole files or writing temporary compressed payloads
+- Added file extent and directory traversal cycle detection
+- Hardened EFS metadata parsing with checked reads and explicit error policy
+- Formalized QNX compressed-ELF header/block parsing as little-endian
+- Fixed aligned directory-name heap overwrite and large compressed-file extraction across more than 100 extents
+
 ### Version 2.0 (2025-06-11)
 - Added comprehensive QNX IFS support with ifsdump tool
 - Refactored ifsdump.c to match efsdump.c structure and style
 - Added support for zlib, LZO, and UCL compression in IFS images
-- Unified build system and documentation for both tools
+- Unified build system and documentation for filesystem extraction tools
 - Added comprehensive test suite and dependency checking
 
 ### Version 1.0 (2025-05-26)

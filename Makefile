@@ -2,11 +2,12 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2
 LIBS = -lm -llzo2 -lucl
 IFS_LIBS = -lm -lz -llzo2 -lucl
-TARGETS = efsdump ifsdump
+TARGETS = efsdump ifsdump decompress-qnx-elf
 EFS_SOURCE = efsdump.c
 IFS_SOURCE = ifsdump.c
+DECOMPRESS_SOURCE = decompress-qnx-elf.c
 
-.PHONY: all clean install test
+.PHONY: all clean install test lint
 
 all: $(TARGETS)
 
@@ -16,12 +17,21 @@ efsdump: $(EFS_SOURCE)
 ifsdump: $(IFS_SOURCE)
 	$(CC) $(CFLAGS) -o ifsdump $(IFS_SOURCE) $(IFS_LIBS)
 
+decompress-qnx-elf: $(DECOMPRESS_SOURCE)
+	$(CC) $(CFLAGS) -o decompress-qnx-elf $(DECOMPRESS_SOURCE) $(LIBS)
+
 clean:
 	rm -f $(TARGETS)
+
+lint:
+	$(CC) $(CFLAGS) -Werror -fsyntax-only $(EFS_SOURCE)
+	$(CC) $(CFLAGS) -Werror -fsyntax-only $(IFS_SOURCE)
+	$(CC) $(CFLAGS) -Werror -fsyntax-only $(DECOMPRESS_SOURCE)
 
 install: $(TARGETS)
 	install -D efsdump $(DESTDIR)/usr/local/bin/efsdump
 	install -D ifsdump $(DESTDIR)/usr/local/bin/ifsdump
+	install -D decompress-qnx-elf $(DESTDIR)/usr/local/bin/decompress-qnx-elf
 	install -D -m 644 README.md $(DESTDIR)/usr/local/share/doc/dumpers/README.md
 
 test: $(TARGETS)
@@ -29,6 +39,8 @@ test: $(TARGETS)
 	./efsdump -h
 	@echo "Testing ifsdump help output..."
 	./ifsdump -h
+	@echo "Testing decompress-qnx-elf help output..."
+	./decompress-qnx-elf -h
 	@echo "Testing on sample images (if available)..."
 	@if [ -f ../SZ-AppR.bin ]; then \
 		echo "Testing efsdump with SZ-AppR.bin:"; \
