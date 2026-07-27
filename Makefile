@@ -2,10 +2,11 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2
 LIBS = -lm -llzo2 -lucl
 IFS_LIBS = -lm -lz -llzo2 -lucl
-TARGETS = efsdump ifsdump decompress-qnx-elf
+TARGETS = efsdump ifsdump decompress-qnx-elf qnx-deflate
 EFS_SOURCE = efsdump.c
 IFS_SOURCE = ifsdump.c
 DECOMPRESS_SOURCE = decompress-qnx-elf.c
+DEFLATE_SOURCE = qnx-deflate.c
 
 .PHONY: all clean install test lint
 
@@ -20,6 +21,9 @@ ifsdump: $(IFS_SOURCE)
 decompress-qnx-elf: $(DECOMPRESS_SOURCE)
 	$(CC) $(CFLAGS) -o decompress-qnx-elf $(DECOMPRESS_SOURCE) $(LIBS)
 
+qnx-deflate: $(DEFLATE_SOURCE)
+	$(CC) $(CFLAGS) -o qnx-deflate $(DEFLATE_SOURCE) $(LIBS)
+
 clean:
 	rm -f $(TARGETS)
 
@@ -27,11 +31,13 @@ lint:
 	$(CC) $(CFLAGS) -Werror -fsyntax-only $(EFS_SOURCE)
 	$(CC) $(CFLAGS) -Werror -fsyntax-only $(IFS_SOURCE)
 	$(CC) $(CFLAGS) -Werror -fsyntax-only $(DECOMPRESS_SOURCE)
+	$(CC) $(CFLAGS) -Werror -fsyntax-only $(DEFLATE_SOURCE)
 
 install: $(TARGETS)
 	install -D efsdump $(DESTDIR)/usr/local/bin/efsdump
 	install -D ifsdump $(DESTDIR)/usr/local/bin/ifsdump
 	install -D decompress-qnx-elf $(DESTDIR)/usr/local/bin/decompress-qnx-elf
+	install -D qnx-deflate $(DESTDIR)/usr/local/bin/qnx-deflate
 	install -D -m 644 README.md $(DESTDIR)/usr/local/share/doc/dumpers/README.md
 
 test: $(TARGETS)
@@ -41,6 +47,8 @@ test: $(TARGETS)
 	./ifsdump -h
 	@echo "Testing decompress-qnx-elf help output..."
 	./decompress-qnx-elf -h
+	@echo "Testing qnx-deflate help output..."
+	./qnx-deflate -h
 	@echo "Testing on sample images (if available)..."
 	@if [ -f ../SZ-AppR.bin ]; then \
 		echo "Testing efsdump with SZ-AppR.bin:"; \

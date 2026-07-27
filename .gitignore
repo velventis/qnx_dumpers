@@ -1,5 +1,6 @@
 efsdump
 ifsdump
+qnx-deflate
 decompress-qnx-elf
 efsdump.old
 

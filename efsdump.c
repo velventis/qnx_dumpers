@@ -13,7 +13,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -60,7 +59,6 @@ static options_t g_options = {
 #define MAX_PATH_LEN 4096
 #define WORKBUF_SIZE (512*1024)
 #define EFS_BOOTINFO_OFFSET 40
-#define EFS_DEFAULT_UNIT_SIZE (128 * 1024)
 #define EFS_NULL_LOGI 0xffff
 #define EFS_NULL_INDEX 0xffff
 #define EFS_COMPRESSED_MAGIC "iwlyfmbp"
@@ -167,10 +165,17 @@ typedef struct {
     dirent_s *dirents;  // Parallel array to heads for directory entries
 } blocks_s;
 
+typedef enum {
+    EFS_BYTE_ORDER_BIG,
+    EFS_BYTE_ORDER_LITTLE
+} efs_byte_order_t;
+
 typedef struct {
     boot_info_s bi;
     blocks_s *blocks;  // Array size determined by bi.unit_total
     long efs_offset;   // Offset where this EFS partition starts in the file
+    efs_byte_order_t byte_order;
+    uint16_t unit_pow2;
 } part_s;
 
 // Compression structures for file extraction
@@ -257,15 +262,6 @@ void print_stat(const char* prefix, stat_s *st);
 void print_extptr(const char* prefix, const char* label, extptr_s *ptr);
 void print_status(const char* prefix, status_b *status);
 
-// Function to swap endianness if needed
-uint16_t swap16(uint16_t val) {
-    return ntohs(val);
-}
-
-uint32_t swap32(uint32_t val) {
-    return ntohl(val);
-}
-
 uint16_t read_le16(uint16_t val) {
     uint8_t *bytes = (uint8_t *)&val;
     return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
@@ -277,6 +273,27 @@ uint32_t read_le32(uint32_t val) {
            ((uint32_t)bytes[1] << 8) |
            ((uint32_t)bytes[2] << 16) |
            ((uint32_t)bytes[3] << 24);
+}
+
+uint16_t read_be16(uint16_t val) {
+    uint8_t *bytes = (uint8_t *)&val;
+    return ((uint16_t)bytes[0] << 8) | (uint16_t)bytes[1];
+}
+
+uint32_t read_be32(uint32_t val) {
+    uint8_t *bytes = (uint8_t *)&val;
+    return ((uint32_t)bytes[0] << 24) |
+           ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) |
+           (uint32_t)bytes[3];
+}
+
+uint16_t read_efs16(uint16_t val, efs_byte_order_t byte_order) {
+    return byte_order == EFS_BYTE_ORDER_LITTLE ? read_le16(val) : read_be16(val);
+}
+
+uint32_t read_efs32(uint32_t val, efs_byte_order_t byte_order) {
+    return byte_order == EFS_BYTE_ORDER_LITTLE ? read_le32(val) : read_be32(val);
 }
 
 // Directory management functions
@@ -659,7 +676,7 @@ int collect_file_extents(part_s *part, uint16_t logi_unit, uint16_t index, file_
 
         // Calculate the actual data offset within the block
         // Each block is unit_pow2 size, data comes before the head_s tables
-        long block_base = part->efs_offset + (current_logi - 1) * (1LL << blocks->ui.unit_pow2);
+        long block_base = part->efs_offset + (current_logi - 1) * (1LL << part->unit_pow2);
         long data_offset = block_base + (long)(head->text_offset_hi) * 0x40000 + (long)(head->text_offset_lo) * 4;
 
         // Reallocate extent array
@@ -1119,20 +1136,21 @@ int extract_compressed_file_data(extent_reader_t *reader, const char *output_pat
 }
 
 // Functions to read structures with endianness conversion
-int read_stat(FILE *fp, stat_s *st) {
+int read_stat(FILE *fp, stat_s *st, efs_byte_order_t byte_order) {
     if (fread(st, sizeof(stat_s), 1, fp) != 1) {
         return -1;
     }
-    st->struct_size = swap16(st->struct_size);
-    st->mode = swap16(st->mode);
-    st->uid = swap32(st->uid);
-    st->gid = swap32(st->gid);
-    st->mtime = swap32(st->mtime);
-    st->ctime = swap32(st->ctime);
+    st->struct_size = read_efs16(st->struct_size, byte_order);
+    st->mode = read_efs16(st->mode, byte_order);
+    st->uid = read_efs32(st->uid, byte_order);
+    st->gid = read_efs32(st->gid, byte_order);
+    st->mtime = read_efs32(st->mtime, byte_order);
+    st->ctime = read_efs32(st->ctime, byte_order);
     return 0;
 }
 
-int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t lo, uint16_t text_size) {
+int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t lo,
+        uint16_t text_size, efs_byte_order_t byte_order) {
     // Calculate absolute offset
     long offset = base_offset + (long)(hi) * 0x40000 + (long)(lo) * 4;
     long current = ftell(fp);
@@ -1150,15 +1168,15 @@ int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t 
         fseek(fp, current, SEEK_SET);
         return -1;
     }
-    dir->struct_size = swap16(dir->struct_size);
+    dir->struct_size = read_efs16(dir->struct_size, byte_order);
     if (fread(&dir->moves, sizeof(uint8_t), 1, fp) != 1 ||
         fread(&dir->namelen, sizeof(uint8_t), 1, fp) != 1 ||
         fread(&dir->first, sizeof(extptr_s), 1, fp) != 1) {
         fseek(fp, current, SEEK_SET);
         return -1;
     }
-    dir->first.logi_unit = swap16(dir->first.logi_unit);
-    dir->first.index = swap16(dir->first.index);
+    dir->first.logi_unit = read_efs16(dir->first.logi_unit, byte_order);
+    dir->first.index = read_efs16(dir->first.index, byte_order);
 
     // Allocate and read name
     size_t name_size = F3S_NAME_ALIGN(dir->namelen);
@@ -1182,7 +1200,7 @@ int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t 
     dir->name[dir->namelen] = '\0';
 
     // Read stat structure
-    if (read_stat(fp, &dir->stat) != 0) {
+    if (read_stat(fp, &dir->stat, byte_order) != 0) {
         free(dir->name);
         dir->name = NULL;
         fseek(fp, current, SEEK_SET);
@@ -1194,63 +1212,78 @@ int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t 
     return 0;
 }
 
-int read_unit_info(FILE *fp, unit_info_s *ui) {
+int read_unit_info(FILE *fp, unit_info_s *ui, efs_byte_order_t byte_order) {
     if (fread(ui, sizeof(unit_info_s), 1, fp) != 1) {
         return -1;
     }
-    ui->struct_size = swap16(ui->struct_size);
-    ui->unit_pow2 = swap16(ui->unit_pow2);
-    ui->reserve = swap16(ui->reserve);
-    ui->erase_count = swap32(ui->erase_count);
-    ui->boot.logi_unit = swap16(ui->boot.logi_unit);
-    ui->boot.index = swap16(ui->boot.index);
+    ui->struct_size = read_efs16(ui->struct_size, byte_order);
+    ui->unit_pow2 = read_efs16(ui->unit_pow2, byte_order);
+    ui->reserve = read_efs16(ui->reserve, byte_order);
+    ui->erase_count = read_efs32(ui->erase_count, byte_order);
+    ui->boot.logi_unit = read_efs16(ui->boot.logi_unit, byte_order);
+    ui->boot.index = read_efs16(ui->boot.index, byte_order);
     return 0;
 }
 
-int read_unit_logi(FILE *fp, unit_logi_s *ul) {
+int read_unit_logi(FILE *fp, unit_logi_s *ul, efs_byte_order_t byte_order) {
     if (fread(ul, sizeof(unit_logi_s), 1, fp) != 1) {
         return -1;
     }
-    ul->struct_size = swap16(ul->struct_size);
-    ul->logi = swap16(ul->logi);
-    ul->age = swap32(ul->age);
+    ul->struct_size = read_efs16(ul->struct_size, byte_order);
+    ul->logi = read_efs16(ul->logi, byte_order);
+    ul->age = read_efs32(ul->age, byte_order);
     for(int i = 0; i < 4; i++) {
-        ul->md5[i] = swap32(ul->md5[i]);
+        ul->md5[i] = read_efs32(ul->md5[i], byte_order);
     }
     return 0;
 }
 
-int read_boot_info(FILE *fp, boot_info_s *bi) {
+int read_boot_info(FILE *fp, boot_info_s *bi, efs_byte_order_t byte_order) {
     if (fread(bi, sizeof(boot_info_s), 1, fp) != 1) {
         return -1;
     }
-    bi->struct_size = swap16(bi->struct_size);
-    bi->unit_index = swap16(bi->unit_index);
-    bi->unit_total = swap16(bi->unit_total);
-    bi->unit_spare = swap16(bi->unit_spare);
-    bi->align_pow2 = swap16(bi->align_pow2);
-    bi->root.logi_unit = swap16(bi->root.logi_unit);
-    bi->root.index = swap16(bi->root.index);
+    bi->struct_size = read_efs16(bi->struct_size, byte_order);
+    bi->unit_index = read_efs16(bi->unit_index, byte_order);
+    bi->unit_total = read_efs16(bi->unit_total, byte_order);
+    bi->unit_spare = read_efs16(bi->unit_spare, byte_order);
+    bi->align_pow2 = read_efs16(bi->align_pow2, byte_order);
+    bi->root.logi_unit = read_efs16(bi->root.logi_unit, byte_order);
+    bi->root.index = read_efs16(bi->root.index, byte_order);
     return 0;
 }
 
-int read_head(FILE *fp, head_s *hd) {
+int read_head(FILE *fp, head_s *hd, efs_byte_order_t byte_order) {
     if (fread(hd, sizeof(head_s), 1, fp) != 1) {
         return -1;
     }
-    for(int i = 0; i < 3; i++) {
-        hd->pad[i] = swap16(hd->pad[i]);
+    if (byte_order == EFS_BYTE_ORDER_LITTLE) {
+        /*
+         * status_b describes QNX's big-endian 32-bit status word as
+         * padding16, flags2, flags1. Little-endian F3S stores the same word as
+         * flags1, flags2, padding16, so it needs a field-order conversion in
+         * addition to the scalar conversions below.
+         */
+        for (int i = 0; i < 3; i++) {
+            uint8_t raw[sizeof(status_b)];
+            memcpy(raw, &hd->status[i], sizeof(raw));
+            hd->status[i].flags1 = raw[0];
+            hd->status[i].flags2 = raw[1];
+            hd->status[i].padding1 = (uint16_t)raw[2] | ((uint16_t)raw[3] << 8);
+        }
     }
-    hd->text_offset_lo = swap16(hd->text_offset_lo);
-    hd->text_size = swap16(hd->text_size);
-    hd->next.logi_unit = swap16(hd->next.logi_unit);
-    hd->next.index = swap16(hd->next.index);
-    hd->super.logi_unit = swap16(hd->super.logi_unit);
-    hd->super.index = swap16(hd->super.index);
+    for(int i = 0; i < 3; i++) {
+        hd->pad[i] = read_efs16(hd->pad[i], byte_order);
+    }
+    hd->text_offset_lo = read_efs16(hd->text_offset_lo, byte_order);
+    hd->text_size = read_efs16(hd->text_size, byte_order);
+    hd->next.logi_unit = read_efs16(hd->next.logi_unit, byte_order);
+    hd->next.index = read_efs16(hd->next.index, byte_order);
+    hd->super.logi_unit = read_efs16(hd->super.logi_unit, byte_order);
+    hd->super.index = read_efs16(hd->super.index, byte_order);
     return 0;
 }
 
-int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size) {
+int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size, efs_byte_order_t byte_order) {
     long block_top_pos = ftell(fp) - 40;
 
     if (unit_size < EFS_BOOTINFO_OFFSET) {
@@ -1262,7 +1295,8 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size) {
         return -1;
     }
 
-    if (read_unit_info(fp, &blocks->ui) != 0 || read_unit_logi(fp, &blocks->ul) != 0) {
+    if (read_unit_info(fp, &blocks->ui, byte_order) != 0 ||
+        read_unit_logi(fp, &blocks->ul, byte_order) != 0) {
         return -1;
     }
 
@@ -1299,7 +1333,7 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size) {
         memset(&blocks->dirents[blocks->head_count - 1], 0, sizeof(dirent_s));
 
         // Read header
-        if (read_head(fp, &blocks->heads[blocks->head_count - 1]) != 0) {
+        if (read_head(fp, &blocks->heads[blocks->head_count - 1], byte_order) != 0) {
             return -1;
         }
 
@@ -1314,7 +1348,7 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size) {
             if (read_dirent(fp, &blocks->dirents[blocks->head_count - 1], block_top_pos,
                     blocks->heads[blocks->head_count - 1].text_offset_hi,
                     blocks->heads[blocks->head_count - 1].text_offset_lo,
-                    blocks->heads[blocks->head_count - 1].text_size) != 0) {
+                    blocks->heads[blocks->head_count - 1].text_size, byte_order) != 0) {
                 blocks->dirents[blocks->head_count - 1].name = NULL;
                 if (g_options.verbose) {
                     printf("        Warning: failed to read directory entry\n");
@@ -1350,13 +1384,36 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size) {
 size_t read_partition(FILE *fp, part_s *part) {
     memset(part, 0, sizeof(*part));
 
+    long partition_start = ftell(fp);
+    unit_info_s first_unit;
+    if (fread(&first_unit, sizeof(first_unit), 1, fp) != 1 ||
+        fseek(fp, partition_start, SEEK_SET) != 0) {
+        return 0;
+    }
+    if (first_unit.endian == 'L') {
+        part->byte_order = EFS_BYTE_ORDER_LITTLE;
+    } else if (first_unit.endian == 'B') {
+        part->byte_order = EFS_BYTE_ORDER_BIG;
+    } else {
+        fprintf(stderr, "Invalid F3S byte-order marker 0x%02x\n",
+                (unsigned char)first_unit.endian);
+        return 0;
+    }
+    part->unit_pow2 = read_efs16(first_unit.unit_pow2, part->byte_order);
+    if (part->unit_pow2 >= sizeof(size_t) * 8 ||
+        ((size_t)1 << part->unit_pow2) < EFS_BOOTINFO_OFFSET) {
+        fprintf(stderr, "Invalid F3S unit size power %u\n", part->unit_pow2);
+        return 0;
+    }
+    size_t unit_size = (size_t)1 << part->unit_pow2;
+
     // Skip to boot info location
     if (fseek(fp, EFS_BOOTINFO_OFFSET, SEEK_CUR) != 0) {
         return 0;
     }
 //    read_unit_info(fp, &blocks->ui);
 //    read_unit_logi(fp, &blocks->ul);
-    if (read_boot_info(fp, &part->bi) != 0) {
+    if (read_boot_info(fp, &part->bi, part->byte_order) != 0) {
         return 0;
     }
     if (fseek(fp, -24, SEEK_CUR) != 0) {
@@ -1369,7 +1426,8 @@ size_t read_partition(FILE *fp, part_s *part) {
     }
 
     if (g_options.verbose) {
-        printf("  Partition Boot Info:\n");
+        printf("  Partition Boot Info (%s-endian):\n",
+               part->byte_order == EFS_BYTE_ORDER_LITTLE ? "little" : "big");
         print_boot_info("    ", &part->bi);
     }
 
@@ -1382,9 +1440,7 @@ size_t read_partition(FILE *fp, part_s *part) {
         if (g_options.verbose) {
             printf("    Logical Unit %d:\n", i + 1);
         }
-        size_t unit_size = (i == 0 || part->blocks[0].ui.unit_pow2 == 0) ?
-            EFS_DEFAULT_UNIT_SIZE : ((size_t)1 << part->blocks[0].ui.unit_pow2);
-        if (read_blocks(fp, &part->blocks[i], unit_size) != 0) {
+        if (read_blocks(fp, &part->blocks[i], unit_size, part->byte_order) != 0) {
             if (g_options.verbose) {
                 printf("    Warning: failed to read logical unit %d, treating it as empty\n", i + 1);
             }
@@ -1399,10 +1455,7 @@ size_t read_partition(FILE *fp, part_s *part) {
             clearerr(fp);
         }
     }
-    if (part->blocks[0].ui.unit_pow2 == 0 || part->blocks[0].ui.unit_pow2 >= (sizeof(size_t) * 8)) {
-        return 0;
-    }
-    return part->bi.unit_total * ((size_t)1 << part->blocks[0].ui.unit_pow2);
+    return part->bi.unit_total * unit_size;
 }
 
 void free_partition(part_s *part) {
