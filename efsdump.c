@@ -7,6 +7,10 @@
  *
  * Author: Jason Tang
  * License: MIT
+ *
+ * Patched: unit header layout (unit_info / unit_logi / boot_info) is no longer
+ * hardcoded to the packed 4-byte-aligned form.  Newer images (e.g. F3S rev 3.x
+ * with align_pow2 = 6) pad these structures to the partition alignment.
  */
 
 #include <stdio.h>
@@ -29,6 +33,7 @@ typedef struct {
     int list_only;
     int verbose;
     int help;
+    size_t head_size;   // 0 = auto-detect the head table stride
 } options_t;
 
 static options_t g_options = {
@@ -37,7 +42,8 @@ static options_t g_options = {
     .partition_index = -1,  // -1 means all partitions
     .list_only = 0,
     .verbose = 0,
-    .help = 0
+    .help = 0,
+    .head_size = 0
 };
 
 /*
@@ -58,11 +64,15 @@ static options_t g_options = {
 #define CMP_UCL     1
 #define MAX_PATH_LEN 4096
 #define WORKBUF_SIZE (512*1024)
-#define EFS_BOOTINFO_OFFSET 40
 #define EFS_NULL_LOGI 0xffff
 #define EFS_NULL_INDEX 0xffff
 #define EFS_COMPRESSED_MAGIC "iwlyfmbp"
 #define EFS_COMPRESSED_MAGIC_LEN 8
+#define EFS_SIG "QSSL_F3S"
+#define EFS_SIG_LEN 8
+#define EFS_SIG_IN_BOOTINFO 4      // offset of sig inside boot_info_s
+#define EFS_MAX_BOOT_SCAN 4096     // how far from the unit start boot_info may be
+#define EFS_MAX_HDR_STRUCT 0x1000  // sanity limit for unit_info/unit_logi struct_size
 
 #pragma pack(push, 1)
 
@@ -176,6 +186,9 @@ typedef struct {
     long efs_offset;   // Offset where this EFS partition starts in the file
     efs_byte_order_t byte_order;
     uint16_t unit_pow2;
+    uint16_t align_pow2;     // from boot_info (clamped), alignment of unit headers
+    uint32_t bootinfo_off;   // offset of boot_info from the start of unit 0
+    uint32_t head_stride;    // distance between head_s entries at the end of a unit
 } part_s;
 
 // Compression structures for file extraction
@@ -296,6 +309,19 @@ uint32_t read_efs32(uint32_t val, efs_byte_order_t byte_order) {
     return byte_order == EFS_BYTE_ORDER_LITTLE ? read_le32(val) : read_be32(val);
 }
 
+static size_t align_up(size_t value, size_t align) {
+    return (value + align - 1) & ~(align - 1);
+}
+
+/*
+ * head_s text offsets are counted in units of the partition alignment:
+ *   byte offset = ((hi << 16) | lo) << align_pow2
+ * (with align_pow2 == 2 this is the old hi * 0x40000 + lo * 4).
+ */
+static long head_text_offset(uint8_t hi, uint16_t lo, unsigned align_pow2) {
+    return (long)((((uint32_t)hi << 16) | lo)) << align_pow2;
+}
+
 // Directory management functions
 void init_dir_state(dir_state_t* state) {
     strcpy(state->path, ".");
@@ -356,6 +382,31 @@ int create_directories(const char* path) {
     return 0;
 }
 
+// Create a directory and all of its parents (mkdir -p)
+static int mkdir_p(const char *path) {
+    char tmp[MAX_PATH_LEN];
+    size_t len = strlen(path);
+
+    if (len == 0 || len >= sizeof(tmp)) {
+        return -1;
+    }
+    memcpy(tmp, path, len + 1);
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                return -1;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        return -1;
+    }
+    return 0;
+}
+
 // CKSUM header handling functions
 int is_cksum_file(FILE *fp) {
     char header[16];
@@ -375,135 +426,126 @@ int is_cksum_file(FILE *fp) {
     return (memcmp(header, "CHKSUM:", 7) == 0);
 }
 
-long find_first_efs_partition(FILE *fp) {
-    char buffer[4096];
+/*
+ * Does a unit_info_s start at p?  Used to walk back from a QSSL_F3S signature
+ * to the real start of the partition, since the distance between the unit start
+ * and boot_info depends on the image's alignment (40 bytes packed, 0xC0 for
+ * 64-byte alignment, ...).
+ */
+static int unit_info_plausible(const uint8_t *p) {
+    efs_byte_order_t bo;
+    uint16_t size16, pow2;
+
+    if (p[2] == 'L') {
+        bo = EFS_BYTE_ORDER_LITTLE;
+    } else if (p[2] == 'B') {
+        bo = EFS_BYTE_ORDER_BIG;
+    } else {
+        return 0;
+    }
+    memcpy(&size16, p, 2);
+    memcpy(&pow2, p + 4, 2);
+    size16 = read_efs16(size16, bo);
+    pow2 = read_efs16(pow2, bo);
+
+    return size16 >= sizeof(unit_info_s) && size16 <= EFS_MAX_HDR_STRUCT &&
+           pow2 >= 7 && pow2 <= 30;
+}
+
+// Given the file offset of a QSSL_F3S signature, find the start of its partition (or -1)
+static long locate_partition_start(FILE *fp, long sig_off) {
+    uint8_t buf[EFS_MAX_BOOT_SCAN];
+    long boot_pos = sig_off - EFS_SIG_IN_BOOTINFO;
+    long lowest = boot_pos - EFS_MAX_BOOT_SCAN;
+
+    if (lowest < 0) {
+        lowest = 0;
+    }
+    if (boot_pos < (long)sizeof(unit_info_s)) {
+        return -1;
+    }
+
+    size_t len = (size_t)(boot_pos - lowest);
+    if (fseek(fp, lowest, SEEK_SET) != 0 || fread(buf, 1, len, fp) != len) {
+        return -1;
+    }
+
+    // Closest plausible unit_info before the boot_info wins
+    for (long pos = boot_pos - (long)sizeof(unit_info_s); pos >= lowest; pos -= 4) {
+        if (unit_info_plausible(buf + (pos - lowest))) {
+            return pos;
+        }
+    }
+    return -1;
+}
+
+// Scan for the next partition at or after start_offset.  Returns partition start or -1.
+static long scan_for_efs_partition(FILE *fp, long start_offset, const char *what) {
+    uint8_t buffer[4096];
     long current_pos = ftell(fp);
 
     if (g_options.verbose) {
-        printf("Scanning for EFS partitions in CKSUM file...\n");
+        printf("Scanning for %s EFS partition starting from offset 0x%lx...\n", what, start_offset);
     }
 
-    // Get file size to know when to stop scanning
-    fseek(fp, 0, SEEK_END);
-    long file_size_tmp = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (file_size_tmp < 0) {
+    if (fseek(fp, 0, SEEK_END) != 0) {
         return -1;
     }
-    size_t file_size = (size_t)file_size_tmp;
+    long file_size = ftell(fp);
+    if (file_size < EFS_SIG_LEN || start_offset < 0) {
+        fseek(fp, current_pos, SEEK_SET);
+        return -1;
+    }
 
-    // Search for QSSL_F3S signature throughout the file
-    size_t offset = 0;
-    while (offset < file_size - 8) {
-        size_t bytes_to_read = (offset + sizeof(buffer) > file_size) ?
-                              (file_size - offset) : sizeof(buffer);
-
+    long offset = start_offset;
+    while (offset + EFS_SIG_LEN <= file_size) {
+        size_t want = sizeof(buffer);
+        if ((long)want > file_size - offset) {
+            want = (size_t)(file_size - offset);
+        }
         if (fseek(fp, offset, SEEK_SET) != 0) {
             break;
         }
-
-        size_t bytes_read = fread(buffer, 1, bytes_to_read, fp);
-        if (bytes_read < 8) {
+        size_t bytes_read = fread(buffer, 1, want, fp);
+        if (bytes_read < EFS_SIG_LEN) {
             break;
         }
 
-        // Search for QSSL_F3S in this buffer
-        for (size_t i = 0; i <= bytes_read - 8; i++) {
-            if (memcmp(buffer + i, "QSSL_F3S", 8) == 0) {
-                size_t signature_offset = offset + i;
-                // EFS partition starts 0x2C bytes before the QSSL_F3S signature
-                long partition_start = (signature_offset >= 0x2C) ? (long)(signature_offset - 0x2C) : -1;
-
-                if (partition_start < 0) {
-                    continue;
-                }
-
-                if (g_options.verbose) {
-                    printf("Found EFS partition at offset 0x%lx (signature at 0x%zx)\n",
-                           partition_start, signature_offset);
-                }
-
-                fseek(fp, current_pos, SEEK_SET);
-                return partition_start;
+        for (size_t i = 0; i + EFS_SIG_LEN <= bytes_read; i++) {
+            if (memcmp(buffer + i, EFS_SIG, EFS_SIG_LEN) != 0) {
+                continue;
             }
+            long signature_offset = offset + (long)i;
+            long partition_start = locate_partition_start(fp, signature_offset);
+            if (partition_start < 0) {
+                continue;
+            }
+
+            if (g_options.verbose) {
+                printf("Found %s EFS partition at offset 0x%lx (signature at 0x%lx)\n",
+                       what, partition_start, signature_offset);
+            }
+            fseek(fp, current_pos, SEEK_SET);
+            return partition_start;
         }
 
-        // Move forward, but overlap by 7 bytes to ensure we don't miss signatures across buffer boundaries
-        offset += bytes_read - 7;
+        // Overlap so a signature straddling the buffer boundary isn't missed
+        offset += (long)bytes_read - (EFS_SIG_LEN - 1);
     }
 
     if (g_options.verbose) {
-        printf("No EFS partition found in file\n");
+        printf("No %s EFS partition found\n", what);
     }
-
     fseek(fp, current_pos, SEEK_SET);
-    return -1;  // No EFS partition found
+    return -1;
+}
+
+long find_first_efs_partition(FILE *fp) {
+    return scan_for_efs_partition(fp, 0, "first");
 }
 
 long find_next_efs_partition(FILE *fp, long start_offset) {
-    char buffer[4096];
-    long current_pos = ftell(fp);
-
-    if (g_options.verbose) {
-        printf("Scanning for next EFS partition starting from offset 0x%lx...\n", start_offset);
-    }
-
-    // Get file size to know when to stop scanning
-    fseek(fp, 0, SEEK_END);
-    long file_size_tmp = ftell(fp);
-
-    if (file_size_tmp < 0) {
-        return -1;
-    }
-    size_t file_size = (size_t)file_size_tmp;
-
-    // Search for QSSL_F3S signature starting from the given offset
-    size_t offset = (size_t)start_offset;
-    while (offset < file_size - 8) {
-        size_t bytes_to_read = (offset + sizeof(buffer) > file_size) ?
-                              (file_size - offset) : sizeof(buffer);
-
-        if (fseek(fp, offset, SEEK_SET) != 0) {
-            break;
-        }
-
-        size_t bytes_read = fread(buffer, 1, bytes_to_read, fp);
-        if (bytes_read < 8) {
-            break;
-        }
-
-        // Search for QSSL_F3S in this buffer
-        for (size_t i = 0; i <= bytes_read - 8; i++) {
-            if (memcmp(buffer + i, "QSSL_F3S", 8) == 0) {
-                size_t signature_offset = offset + i;
-                // EFS partition starts 0x2C bytes before the QSSL_F3S signature
-                long partition_start = (signature_offset >= 0x2C) ? (long)(signature_offset - 0x2C) : -1;
-
-                if (partition_start < 0) {
-                    continue;
-                }
-
-                if (g_options.verbose) {
-                    printf("Found next EFS partition at offset 0x%lx (signature at 0x%zx)\n",
-                           partition_start, signature_offset);
-                }
-
-                fseek(fp, current_pos, SEEK_SET);
-                return partition_start;
-            }
-        }
-
-        // Move forward, but overlap by 7 bytes to ensure we don't miss signatures across buffer boundaries
-        offset += bytes_read - 7;
-    }
-
-    if (g_options.verbose) {
-        printf("No additional EFS partitions found\n");
-    }
-
-    fseek(fp, current_pos, SEEK_SET);
-    return -1;  // No additional EFS partition found
+    return scan_for_efs_partition(fp, start_offset, "next");
 }
 
 // Find a file extent by logical unit and index
@@ -677,7 +719,7 @@ int collect_file_extents(part_s *part, uint16_t logi_unit, uint16_t index, file_
         // Calculate the actual data offset within the block
         // Each block is unit_pow2 size, data comes before the head_s tables
         long block_base = part->efs_offset + (current_logi - 1) * (1LL << part->unit_pow2);
-        long data_offset = block_base + (long)(head->text_offset_hi) * 0x40000 + (long)(head->text_offset_lo) * 4;
+        long data_offset = block_base + head_text_offset(head->text_offset_hi, head->text_offset_lo, part->align_pow2);
 
         // Reallocate extent array
         if (*extent_count == extent_capacity) {
@@ -775,11 +817,13 @@ int read_directory_contents(FILE *fp, part_s *part, dirent_s *dir_entry, const c
                 if (strcmp(content_entry->name, ".") == 0 || strcmp(content_entry->name, "..") == 0 || strcmp(content_entry->name, "/") == 0) {
                     // Skip these
                 } else {
-                    // This is a subdirectory
+                    // This is a subdirectory.  Strip a leading "./" or "/" but keep
+                    // dotfile names such as ".ecc_on" intact.
                     const char *clean_name = content_entry->name;
-                    if (clean_name[0] == '.') {
-                        clean_name++;
-                    } else if (clean_name[0] == '/') {
+                    while (clean_name[0] == '.' && clean_name[1] == '/') {
+                        clean_name += 2;
+                    }
+                    while (clean_name[0] == '/') {
                         clean_name++;
                     }
 
@@ -789,7 +833,7 @@ int read_directory_contents(FILE *fp, part_s *part, dirent_s *dir_entry, const c
                     if (g_options.list_only) {
                         printf("d %s\n", subdir_path);
                     } else {
-                        if (mkdir(subdir_path, 0755) != 0 && errno != EEXIST) {
+                        if (mkdir_p(subdir_path) != 0) {
                             fprintf(stderr, "Failed to create directory %s: %s\n", subdir_path, strerror(errno));
                         } else if (g_options.verbose) {
                             printf("        Created subdirectory: %s\n", subdir_path);
@@ -898,8 +942,23 @@ void traverse_directory(FILE *fp, part_s *part, uint16_t logi_unit, uint16_t ind
             .depth = 0
         };
 
-        // Process any directory entry, not just root
-        const char *dir_path = (strcmp(dirent->name, "/") == 0) ? "." : dirent->name + 1; // Skip leading '/'
+        // Process any directory entry, not just root.  The root of a partition is
+        // often a mount point such as "/mnt/wavedata"; skip leading slashes only.
+        const char *dir_path = dirent->name;
+        while (dir_path[0] == '/') {
+            dir_path++;
+        }
+        if (dir_path[0] == '\0') {
+            dir_path = ".";
+        }
+
+        if (!g_options.list_only && mkdir_p(dir_path) != 0) {
+            fprintf(stderr, "Failed to create directory %s: %s\n", dir_path, strerror(errno));
+        }
+        if (g_options.list_only) {
+            printf("d %s\n", dir_path);
+        }
+
         if (read_directory_contents(fp, part, dirent, dir_path, &state) != 0 && g_options.verbose) {
             printf("      Warning: stopped directory traversal at unit=%u, index=%u\n", logi_unit, index);
         }
@@ -1150,9 +1209,9 @@ int read_stat(FILE *fp, stat_s *st, efs_byte_order_t byte_order) {
 }
 
 int read_dirent(FILE *fp, dirent_s *dir, long base_offset, uint8_t hi, uint16_t lo,
-        uint16_t text_size, efs_byte_order_t byte_order) {
+        uint16_t text_size, efs_byte_order_t byte_order, unsigned align_pow2) {
     // Calculate absolute offset
-    long offset = base_offset + (long)(hi) * 0x40000 + (long)(lo) * 4;
+    long offset = base_offset + head_text_offset(hi, lo, align_pow2);
     long current = ftell(fp);
     const size_t fixed_size = sizeof(uint16_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(extptr_s);
 
@@ -1225,15 +1284,40 @@ int read_unit_info(FILE *fp, unit_info_s *ui, efs_byte_order_t byte_order) {
     return 0;
 }
 
-int read_unit_logi(FILE *fp, unit_logi_s *ul, efs_byte_order_t byte_order) {
-    if (fread(ul, sizeof(unit_logi_s), 1, fp) != 1) {
+/*
+ * Read a unit_logi_s located at absolute offset `pos`.
+ *
+ * The on-disk struct can be larger than sizeof(unit_logi_s): in rev 3.x images
+ * struct_size is 0x50 and the MD5 sits at the *end* of the struct, not right
+ * after `age`.  So read the 8 byte head, then fetch the MD5 from
+ * pos + struct_size - 16.
+ */
+static int read_unit_logi_at(FILE *fp, unit_logi_s *ul, long pos, efs_byte_order_t byte_order) {
+    uint8_t raw[8];
+    uint16_t size16, logi16;
+    uint32_t age32, md5[4];
+
+    memset(ul, 0, sizeof(*ul));
+    if (fseek(fp, pos, SEEK_SET) != 0 || fread(raw, 1, sizeof(raw), fp) != sizeof(raw)) {
         return -1;
     }
-    ul->struct_size = read_efs16(ul->struct_size, byte_order);
-    ul->logi = read_efs16(ul->logi, byte_order);
-    ul->age = read_efs32(ul->age, byte_order);
-    for(int i = 0; i < 4; i++) {
-        ul->md5[i] = read_efs32(ul->md5[i], byte_order);
+    memcpy(&size16, raw, 2);
+    memcpy(&logi16, raw + 2, 2);
+    memcpy(&age32, raw + 4, 4);
+    ul->struct_size = read_efs16(size16, byte_order);
+    ul->logi = read_efs16(logi16, byte_order);
+    ul->age = read_efs32(age32, byte_order);
+
+    if (ul->struct_size < sizeof(unit_logi_s) || ul->struct_size > EFS_MAX_HDR_STRUCT) {
+        return -1;  // erased or garbage header
+    }
+
+    if (fseek(fp, pos + (long)ul->struct_size - (long)sizeof(md5), SEEK_SET) != 0 ||
+        fread(md5, sizeof(md5), 1, fp) != 1) {
+        return -1;
+    }
+    for (int i = 0; i < 4; i++) {
+        ul->md5[i] = read_efs32(md5[i], byte_order);
     }
     return 0;
 }
@@ -1283,20 +1367,42 @@ int read_head(FILE *fp, head_s *hd, efs_byte_order_t byte_order) {
     return 0;
 }
 
-int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size, efs_byte_order_t byte_order) {
-    long block_top_pos = ftell(fp) - 40;
+/*
+ * Read one logical unit that starts at absolute offset `unit_start`.
+ *
+ * Unit layout (offsets from the unit start):
+ *   0                                 unit_info_s
+ *   align_up(unit_info.struct_size)   unit_logi_s (struct_size bytes)
+ *   ...                               data / boot_info / dirents
+ *   unit_size - N*head_stride         head_s table, growing downward from the
+ *                                     end of the unit (index 0 is the highest)
+ *
+ * `align` is 1 << boot_info.align_pow2.  The previous version read unit_info
+ * from the start of the *next* unit (so the last unit always failed) and
+ * assumed unit_info + unit_logi were exactly 40 bytes.
+ */
+static int read_blocks(FILE *fp, blocks_s *blocks, const part_s *part, long unit_start) {
+    const size_t unit_size = (size_t)1 << part->unit_pow2;
+    const size_t align = (size_t)1 << part->align_pow2;
+    const size_t stride = part->head_stride;
+    const efs_byte_order_t byte_order = part->byte_order;
 
-    if (unit_size < EFS_BOOTINFO_OFFSET) {
+    blocks->heads = NULL;
+    blocks->dirents = NULL;
+    blocks->head_count = 0;
+
+    if (fseek(fp, unit_start, SEEK_SET) != 0 ||
+        read_unit_info(fp, &blocks->ui, byte_order) != 0) {
         return -1;
     }
 
-    // Skip padding
-    if (fseek(fp, (long)(unit_size - EFS_BOOTINFO_OFFSET), SEEK_CUR) != 0) {
-        return -1;
+    size_t ui_size = blocks->ui.struct_size;
+    if (ui_size < sizeof(unit_info_s) || ui_size > EFS_MAX_HDR_STRUCT) {
+        ui_size = sizeof(unit_info_s);
     }
-
-    if (read_unit_info(fp, &blocks->ui, byte_order) != 0 ||
-        read_unit_logi(fp, &blocks->ul, byte_order) != 0) {
+    size_t logi_off = align_up(ui_size, align);
+    if (logi_off + sizeof(unit_logi_s) > unit_size ||
+        read_unit_logi_at(fp, &blocks->ul, unit_start + (long)logi_off, byte_order) != 0) {
         return -1;
     }
 
@@ -1305,17 +1411,15 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size, efs_byte_order_t b
         print_unit_logi("      ", &blocks->ul);
     }
 
-    long pos = ftell(fp);
-    if (fseek(fp, -40-32, SEEK_CUR) != 0) {
-        return -1;
-    }
+    size_t min_slot = logi_off + blocks->ul.struct_size;  // headers must not overlap these
 
-    // Initialize arrays
-    blocks->heads = NULL;
-    blocks->dirents = NULL;
-    blocks->head_count = 0;
+    while (1) {
+        size_t n = blocks->head_count;
+        size_t back = (n + 1) * stride;
+        if (back >= unit_size || unit_size - back < min_slot) {
+            break;  // ran out of room in this unit
+        }
 
-    while(1) {
         blocks->head_count++;
         head_s *new_heads = realloc(blocks->heads, blocks->head_count * sizeof(head_s));
         if (!new_heads) {
@@ -1330,42 +1434,41 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size, efs_byte_order_t b
             return -1;
         }
         blocks->dirents = new_dirents;
-        memset(&blocks->dirents[blocks->head_count - 1], 0, sizeof(dirent_s));
+        memset(&blocks->dirents[n], 0, sizeof(dirent_s));
 
         // Read header
-        if (read_head(fp, &blocks->heads[blocks->head_count - 1], byte_order) != 0) {
+        long slot = unit_start + (long)(unit_size - back);
+        if (fseek(fp, slot, SEEK_SET) != 0 ||
+            read_head(fp, &blocks->heads[n], byte_order) != 0) {
             return -1;
         }
 
         if (g_options.verbose) {
             printf("      Header %zu:\n", blocks->head_count);
-            print_head("        ", &blocks->heads[blocks->head_count - 1]);
+            print_head("        ", &blocks->heads[n]);
         }
 
         // Read corresponding dirent
-        extent_type_e exttype = (blocks->heads[blocks->head_count - 1].status[0].flags2) & 0x03;
+        extent_type_e exttype = (blocks->heads[n].status[0].flags2) & 0x03;
         if (exttype == EXTTYPE_DIR) {
-            if (read_dirent(fp, &blocks->dirents[blocks->head_count - 1], block_top_pos,
-                    blocks->heads[blocks->head_count - 1].text_offset_hi,
-                    blocks->heads[blocks->head_count - 1].text_offset_lo,
-                    blocks->heads[blocks->head_count - 1].text_size, byte_order) != 0) {
-                blocks->dirents[blocks->head_count - 1].name = NULL;
+            if (read_dirent(fp, &blocks->dirents[n], unit_start,
+                    blocks->heads[n].text_offset_hi,
+                    blocks->heads[n].text_offset_lo,
+                    blocks->heads[n].text_size, byte_order, part->align_pow2) != 0) {
+                blocks->dirents[n].name = NULL;
                 if (g_options.verbose) {
                     printf("        Warning: failed to read directory entry\n");
                 }
             } else if (g_options.verbose) {
-                print_dirent("        ", &blocks->dirents[blocks->head_count - 1]);
+                print_dirent("        ", &blocks->dirents[n]);
             }
         } else {
             // Initialize name to NULL for non-directory entries
-            blocks->dirents[blocks->head_count - 1].name = NULL;
-        }
-        if (fseek(fp, -64, SEEK_CUR) != 0) {
-            return -1;
+            blocks->dirents[n].name = NULL;
         }
 
         // Check LAST flag in first status
-        if((blocks->heads[blocks->head_count - 1].status[0].flags1 >> 7) & 0x1) {
+        if((blocks->heads[n].status[0].flags1 >> 7) & 0x1) {
             break;
         }
 
@@ -1377,70 +1480,46 @@ int read_blocks(FILE *fp, blocks_s *blocks, size_t unit_size, efs_byte_order_t b
             break;
         }
     }
-    fseek(fp, pos, SEEK_SET);
     return 0;
 }
 
-size_t read_partition(FILE *fp, part_s *part) {
-    memset(part, 0, sizeof(*part));
+/*
+ * Find boot_info inside the first unit by looking for the QSSL_F3S signature
+ * (it is 4 bytes into boot_info_s).  Returns its offset from the unit start,
+ * or -1.  The offset depends on the image's alignment, so it can't be a constant.
+ */
+static long find_bootinfo_offset(FILE *fp, long unit_start, size_t unit_size) {
+    uint8_t buf[EFS_MAX_BOOT_SCAN];
+    size_t want = unit_size < sizeof(buf) ? unit_size : sizeof(buf);
 
-    long partition_start = ftell(fp);
-    unit_info_s first_unit;
-    if (fread(&first_unit, sizeof(first_unit), 1, fp) != 1 ||
-        fseek(fp, partition_start, SEEK_SET) != 0) {
-        return 0;
+    if (fseek(fp, unit_start, SEEK_SET) != 0) {
+        return -1;
     }
-    if (first_unit.endian == 'L') {
-        part->byte_order = EFS_BYTE_ORDER_LITTLE;
-    } else if (first_unit.endian == 'B') {
-        part->byte_order = EFS_BYTE_ORDER_BIG;
-    } else {
-        fprintf(stderr, "Invalid F3S byte-order marker 0x%02x\n",
-                (unsigned char)first_unit.endian);
-        return 0;
+    size_t n = fread(buf, 1, want, fp);
+
+    for (size_t i = sizeof(unit_info_s); i + EFS_SIG_IN_BOOTINFO + EFS_SIG_LEN <= n; i += 4) {
+        if (memcmp(buf + i + EFS_SIG_IN_BOOTINFO, EFS_SIG, EFS_SIG_LEN) == 0) {
+            return (long)i;
+        }
     }
-    part->unit_pow2 = read_efs16(first_unit.unit_pow2, part->byte_order);
-    if (part->unit_pow2 >= sizeof(size_t) * 8 ||
-        ((size_t)1 << part->unit_pow2) < EFS_BOOTINFO_OFFSET) {
-        fprintf(stderr, "Invalid F3S unit size power %u\n", part->unit_pow2);
-        return 0;
-    }
+    return -1;
+}
+
+// Read every logical unit of a partition using part->head_stride
+static int read_all_units(FILE *fp, part_s *part, long partition_start) {
     size_t unit_size = (size_t)1 << part->unit_pow2;
 
-    // Skip to boot info location
-    if (fseek(fp, EFS_BOOTINFO_OFFSET, SEEK_CUR) != 0) {
-        return 0;
-    }
-//    read_unit_info(fp, &blocks->ui);
-//    read_unit_logi(fp, &blocks->ul);
-    if (read_boot_info(fp, &part->bi, part->byte_order) != 0) {
-        return 0;
-    }
-    if (fseek(fp, -24, SEEK_CUR) != 0) {
-        return 0;
-    }
-
-    if (part->bi.unit_total == 0 || part->bi.unit_total > 4096 || memcmp(part->bi.sig, "QSSL_F3S", 8) != 0) {
-        fprintf(stderr, "Invalid partition boot info\n");
-        return 0;
-    }
-
-    if (g_options.verbose) {
-        printf("  Partition Boot Info (%s-endian):\n",
-               part->byte_order == EFS_BYTE_ORDER_LITTLE ? "little" : "big");
-        print_boot_info("    ", &part->bi);
-    }
-
-    // Allocate and read blocks
     part->blocks = calloc(part->bi.unit_total, sizeof(blocks_s));
     if (!part->blocks) {
-        return 0;
+        return -1;
     }
-    for(int i = 0; i < part->bi.unit_total; i++) {
+
+    for (int i = 0; i < part->bi.unit_total; i++) {
         if (g_options.verbose) {
             printf("    Logical Unit %d:\n", i + 1);
         }
-        if (read_blocks(fp, &part->blocks[i], unit_size, part->byte_order) != 0) {
+        long unit_start = partition_start + (long)((size_t)i * unit_size);
+        if (read_blocks(fp, &part->blocks[i], part, unit_start) != 0) {
             if (g_options.verbose) {
                 printf("    Warning: failed to read logical unit %d, treating it as empty\n", i + 1);
             }
@@ -1455,6 +1534,152 @@ size_t read_partition(FILE *fp, part_s *part) {
             clearerr(fp);
         }
     }
+    return 0;
+}
+
+// The root extent must be a directory entry whose name parsed; otherwise the head layout is wrong
+static int root_is_valid(const part_s *part) {
+    uint16_t unit = part->bi.root.logi_unit;
+    uint16_t idx = part->bi.root.index;
+
+    if (!part->blocks || unit == 0 || unit == EFS_NULL_LOGI || unit > part->bi.unit_total) {
+        return 0;
+    }
+    const blocks_s *b = &part->blocks[unit - 1];
+    if (idx >= b->head_count) {
+        return 0;
+    }
+    if (((b->heads[idx].status[0].flags2) & 0x03) != EXTTYPE_DIR) {
+        return 0;
+    }
+    return b->dirents[idx].name != NULL;
+}
+
+// Reads a partition starting at the current file position.
+// Returns the partition size in bytes, or 0 on failure.
+size_t read_partition(FILE *fp, part_s *part) {
+    memset(part, 0, sizeof(*part));
+
+    long partition_start = ftell(fp);
+    unit_info_s first_unit;
+    if (partition_start < 0 ||
+        fread(&first_unit, sizeof(first_unit), 1, fp) != 1 ||
+        fseek(fp, partition_start, SEEK_SET) != 0) {
+        return 0;
+    }
+    if (first_unit.endian == 'L') {
+        part->byte_order = EFS_BYTE_ORDER_LITTLE;
+    } else if (first_unit.endian == 'B') {
+        part->byte_order = EFS_BYTE_ORDER_BIG;
+    } else {
+        fprintf(stderr, "Invalid F3S byte-order marker 0x%02x\n",
+                (unsigned char)first_unit.endian);
+        return 0;
+    }
+    part->efs_offset = partition_start;
+    part->unit_pow2 = read_efs16(first_unit.unit_pow2, part->byte_order);
+    if (part->unit_pow2 < 7 || part->unit_pow2 > 30 ||
+        part->unit_pow2 >= sizeof(size_t) * 8) {
+        fprintf(stderr, "Invalid F3S unit size power %u\n", part->unit_pow2);
+        return 0;
+    }
+    size_t unit_size = (size_t)1 << part->unit_pow2;
+
+    // Locate boot_info by signature instead of assuming a fixed offset
+    long boot_off = find_bootinfo_offset(fp, partition_start, unit_size);
+    if (boot_off < 0) {
+        fprintf(stderr, "Invalid partition boot info (no %s signature in first unit)\n", EFS_SIG);
+        return 0;
+    }
+    part->bootinfo_off = (uint32_t)boot_off;
+
+    if (fseek(fp, partition_start + boot_off, SEEK_SET) != 0 ||
+        read_boot_info(fp, &part->bi, part->byte_order) != 0) {
+        return 0;
+    }
+
+    if (part->bi.unit_total == 0 || part->bi.unit_total > 4096 || memcmp(part->bi.sig, EFS_SIG, EFS_SIG_LEN) != 0) {
+        fprintf(stderr, "Invalid partition boot info\n");
+        return 0;
+    }
+
+    // Alignment of unit headers; guard against garbage values
+    part->align_pow2 = part->bi.align_pow2 <= 12 ? part->bi.align_pow2 : 2;
+    size_t align = (size_t)1 << part->align_pow2;
+
+    if (g_options.verbose) {
+        printf("  Partition Boot Info (%s-endian) at +0x%lx:\n",
+               part->byte_order == EFS_BYTE_ORDER_LITTLE ? "little" : "big", boot_off);
+        print_boot_info("    ", &part->bi);
+    }
+
+    /*
+     * Work out the head_s stride.  The default is sizeof(head_s) (32), the
+     * partition alignment is the other natural candidate.  -H overrides.
+     * Each candidate is validated by checking that the root extent resolves to a
+     * directory entry with a readable name.
+     */
+    size_t candidates[2];
+    int ncand = 0;
+    if (g_options.head_size) {
+        candidates[ncand++] = g_options.head_size;
+    } else {
+        candidates[ncand++] = sizeof(head_s);
+        size_t aligned = align_up(sizeof(head_s), align);
+        if (aligned != sizeof(head_s)) {
+            candidates[ncand++] = aligned;
+        }
+    }
+
+    int saved_verbose = g_options.verbose;
+    int chosen = -1;
+    g_options.verbose = 0;  // keep the probing quiet
+    for (int c = 0; c < ncand; c++) {
+        part->head_stride = (uint32_t)candidates[c];
+        if (read_all_units(fp, part, partition_start) != 0) {
+            g_options.verbose = saved_verbose;
+            return 0;
+        }
+        if (root_is_valid(part)) {
+            chosen = c;
+            break;
+        }
+        free_partition(part);
+    }
+    g_options.verbose = saved_verbose;
+
+    int valid = chosen >= 0;
+    if (!valid) {
+        chosen = 0;
+        fprintf(stderr, "Warning: root directory entry (unit=%u, index=%u) could not be resolved; "
+                        "the head table layout may differ (try -H <stride> and -v)\n",
+                part->bi.root.logi_unit, part->bi.root.index);
+    }
+    part->head_stride = (uint32_t)candidates[chosen];
+
+    // Re-read with output enabled, or reload if the last probe was discarded
+    if (!valid || saved_verbose) {
+        if (part->blocks) {
+            free_partition(part);
+        }
+        if (read_all_units(fp, part, partition_start) != 0) {
+            return 0;
+        }
+    }
+
+    if (saved_verbose) {
+        printf("  Unit header alignment: %zu, head stride: %u\n", align, part->head_stride);
+        if (part->blocks[0].ul.struct_size != 0) {
+            size_t ui_size = part->blocks[0].ui.struct_size;
+            if (ui_size < sizeof(unit_info_s) || ui_size > EFS_MAX_HDR_STRUCT) {
+                ui_size = sizeof(unit_info_s);
+            }
+            size_t expected = align_up(align_up(ui_size, align) + part->blocks[0].ul.struct_size, align);
+            printf("  boot_info offset 0x%x (header layout predicts 0x%zx)\n",
+                   part->bootinfo_off, expected);
+        }
+    }
+
     return part->bi.unit_total * unit_size;
 }
 
@@ -1473,6 +1698,7 @@ void free_partition(part_s *part) {
         free(part->blocks[i].dirents);
     }
     free(part->blocks);
+    part->blocks = NULL;
 }
 
 void print_extptr(const char* prefix, const char* label, extptr_s *ptr) {
@@ -1760,6 +1986,8 @@ void print_usage(const char *progname) {
     printf("  -l, --list-partitions  List all partitions in the image\n");
     printf("  -p, --partition NUM    Extract only partition NUM (0-based, default: all)\n");
     printf("  -c, --list-contents    List contents without extracting files\n");
+    printf("  -H, --head-size BYTES  Stride of the head table at the end of each unit\n");
+    printf("                         (default: auto-detect, tries 32 then the alignment)\n");
     printf("  -v, --verbose          Enable verbose output\n");
     printf("  -h, --help             Show this help message\n\n");
     printf("Examples:\n");
@@ -1777,6 +2005,7 @@ int parse_arguments(int argc, char *argv[]) {
         {"list-partitions", no_argument,       0, 'l'},
         {"partition",       required_argument, 0, 'p'},
         {"list-contents",   no_argument,       0, 'c'},
+        {"head-size",       required_argument, 0, 'H'},
         {"verbose",         no_argument,       0, 'v'},
         {"help",            no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -1785,7 +2014,7 @@ int parse_arguments(int argc, char *argv[]) {
     int option_index = 0;
     int c;
 
-    while ((c = getopt_long(argc, argv, "d:lp:cvh", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "d:lp:cH:vh", long_options, &option_index)) != -1) {
         switch (c) {
             case 'd':
                 g_options.target_dir = optarg;
@@ -1799,6 +2028,15 @@ int parse_arguments(int argc, char *argv[]) {
             case 'c':
                 g_options.list_only = 1;
                 break;
+            case 'H': {
+                long v = strtol(optarg, NULL, 0);
+                if (v < (long)sizeof(head_s) || v > 4096) {
+                    fprintf(stderr, "Error: --head-size must be between %zu and 4096\n", sizeof(head_s));
+                    return -1;
+                }
+                g_options.head_size = (size_t)v;
+                break;
+            }
             case 'v':
                 g_options.verbose = 1;
                 break;
@@ -1880,7 +2118,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Read partitions
+    // Read partitions (read_partition records each partition's file offset itself)
     size_t next_part = 0;
     part_s partitions[2];
     int partition_count = 0;
@@ -1890,7 +2128,6 @@ int main(int argc, char *argv[]) {
         printf("Reading partition 0...\n");
     }
     next_part = read_partition(fp, &partitions[0]);
-    partitions[0].efs_offset = efs_offset;  // Store the EFS offset
     if (next_part > 0) {
         partition_count++;
 
@@ -1900,12 +2137,11 @@ int main(int argc, char *argv[]) {
         }
 
         // Search for the next EFS partition starting after the first one
-        long search_start = efs_offset + next_part;
+        long search_start = efs_offset + (long)next_part;
         long second_efs_offset = find_next_efs_partition(fp, search_start);
         if (second_efs_offset >= 0) {
             fseek(fp, second_efs_offset, SEEK_SET);
             size_t next_part2 = read_partition(fp, &partitions[1]);
-            partitions[1].efs_offset = second_efs_offset;  // Store the second EFS offset
             if (next_part2 > 0) {
                 partition_count++;
             }
